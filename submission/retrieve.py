@@ -41,11 +41,67 @@ correctly, so it exercises the full build -> disk -> fresh process -> load
 close to zero; replace the logic, but keep the same
 persist-in-build / reconstruct-in-load shape.
 """
-import json
+import math
 import os
-from typing import List, Optional, Tuple
+import pickle
+import re
+from collections import defaultdict
+from heapq import nlargest
+from typing import Dict, List, Optional, Tuple
 
 from submission.corpus_utils import load_corpus
+
+# Initial steps: 1. Stopwords, 2. Tokenization, 3. Stemming, 4. Indexing, 5. Scoring
+
+_INDEX_FILENAME = "index.pkl"
+
+K1 = 1.2
+B = 0.75
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+_STOPWORDS = frozenset("""
+a an and are as at be but by for if in into is it no not of on or such that the
+their then there these they this to was will with from he she his her its we you
+i has have had been were which who whom what when where how all any can do does
+did done more most other some than too very s t don now
+""".split())
+
+try:
+    from nltk.stem import PorterStemmer
+    _STEMMER = PorterStemmer()
+    _stem_fn = _STEMMER.stem
+except Exception:
+    _stem_fn = lambda w: w
+
+_STEM_CACHE: Dict[str, str] = {}
+
+
+def _stem(word: str) -> str:
+    cached = _STEM_CACHE.get(word)
+    if cached is None:
+        cached = _stem_fn(word)
+        _STEM_CACHE[word] = cached
+    return cached
+
+
+def analyze(text: str) -> List[str]:
+    """Tokenise, lowercase, drop stopwords, stem. Used for BOTH documents
+    and queries - any divergence here silently destroys recall."""
+    return [
+        _stem(tok)
+        for tok in _TOKEN_RE.findall(text.lower())
+        if tok not in _STOPWORDS and len(tok) > 1
+    ]
+
+
+# --- module-level state populated by load_index() --------------------------
+_POSTINGS: Optional[Dict[str, List[Tuple[int, int]]]] = None
+_DOC_IDS: Optional[List[str]] = None
+_DOC_LEN: Optional[List[int]] = None
+_N: int = 0
+_AVGDL: float = 0.0
+
 
 # TODO(you): once implemented, import and use your real scorers, e.g.:
 # from submission import bm25, boolean_vsm, custom_scorer
@@ -85,10 +141,41 @@ def build_index(corpus_path: str, index_dir: str) -> None:
     #
     # The trivial baseline below only persists doc_id order, which is all
     # `_baseline_retrieve` needs.
+
+    postings: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    doc_ids: List[str] = []
+    doc_len: List[int] = []
+
+    for doc_idx, (doc_id, text) in enumerate(corpus):
+        tokens = analyze(text)
+        doc_ids.append(doc_id)
+        doc_len.append(len(tokens))
+
+        tf: Dict[str, int] = {}
+        for tok in tokens:
+            tf[tok] = tf.get(tok, 0) + 1
+        for term, count in tf.items():
+            postings[term].append((doc_idx, count))
+
+    total_len = sum(doc_len)
+    n_docs = len(doc_ids)
+    avgdl = (total_len / n_docs) if n_docs else 0.0
+
     os.makedirs(index_dir, exist_ok=True)
-    doc_order = [doc_id for doc_id, _text in corpus]
-    with open(os.path.join(index_dir, _DOC_ORDER_FILENAME), "w", encoding="utf-8") as f:
-        json.dump(doc_order, f)
+
+    payload = {
+        "postings": dict(postings),
+        "doc_ids": doc_ids,
+        "doc_len": doc_len,
+        "avgdl": avgdl,
+    }
+
+    with open(os.path.join(index_dir, _INDEX_FILENAME), "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    #doc_order = [doc_id for doc_id, _text in corpus]
+    #with open(os.path.join(index_dir, _DOC_ORDER_FILENAME), "w", encoding="utf-8") as f:
+    #    json.dump(doc_order, f)
 
 
 def load_index(index_dir: str) -> None:
@@ -96,7 +183,7 @@ def load_index(index_dir: str) -> None:
     `index_dir`. Runs once, in a fresh process, before any retrieve()
     calls — there is no leftover state from build_index() to rely on.
     """
-    global _DOC_ORDER
+    global _DOC_ORDER, _POSTINGS, _DOC_IDS, _DOC_LEN, _N, _AVGDL
 
     # TODO(you): load your real index here, e.g.:
     #
@@ -106,13 +193,48 @@ def load_index(index_dir: str) -> None:
     #   boolean_vsm.build(index)
     #
     # and store it in a module-level variable so retrieve() can use it.
-    path = os.path.join(index_dir, _DOC_ORDER_FILENAME)
-    with open(path, encoding="utf-8") as f:
-        _DOC_ORDER = json.load(f)
+    # path = os.path.join(index_dir, _DOC_ORDER_FILENAME)
+    # with open(path, encoding="utf-8") as f:
+    #   _DOC_ORDER = json.load(f)
+
+    with open(os.path.join(index_dir, _INDEX_FILENAME), "rb") as f:
+        payload = pickle.load(f)
+
+    _POSTINGS = payload["postings"]
+    _DOC_IDS = payload["doc_ids"]
+    _DOC_LEN = payload["doc_len"]
+    _AVGDL = payload["avgdl"]
+    _N = len(_DOC_IDS)
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, best first."""
+
+    if _POSTINGS is None or _DOC_IDS is None or _DOC_LEN is None:
+        raise RuntimeError("retrieve() called before load_index()")
+
+    terms = analyze(query)
+    if not terms:
+        return []
+
+    scores: Dict[int, float] = defaultdict(float)
+    doc_len = _DOC_LEN
+    avgdl = _AVGDL or 1.0
+
+    for term in set(terms):
+        plist = _POSTINGS.get(term)
+        if not plist:
+            continue
+        df = len(plist)
+        idf = math.log(1.0 + (_N - df + 0.5) / (df + 0.5))
+        for doc_idx, tf in plist:
+            norm = K1 * (1.0 - B + B * doc_len[doc_idx] / avgdl)
+            scores[doc_idx] += idf * tf * (K1 + 1.0) / (tf + norm)
+
+    top = nlargest(k, scores.items(), key=lambda kv: (kv[1], -kv[0]))
+    return [(_DOC_IDS[idx], float(score)) for idx, score in top]
+
+    '''
     if _DOC_ORDER is None:
         raise RuntimeError(
             "retrieve() called before load_index(); the harness always "
@@ -125,7 +247,7 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     # TODO(you): replace this with a real scorer, e.g.:
     #   return bm25.score(query, k, k1=1.2, b=0.75)
     return _baseline_retrieve(query, k)
-
+    '''
 
 # ---------------------------------------------------------------------------
 # Trivial reference baseline — DO NOT submit this as your final entry.
